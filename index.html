@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>نظام إدارة المستشفى</title>
+<!-- ===== PWA: تسجيل Service Worker للعمل أوفلاين ===== -->
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').then(reg => {
+      console.log('[PWA] Service Worker مسجّل ✅', reg.scope);
+    }).catch(err => {
+      console.warn('[PWA] فشل تسجيل Service Worker:', err);
+    });
+  }
+</script>
+
+<!-- ===== sql.js: تحميل ذكي مع كاش WASM في IndexedDB ===== -->
+<script>
+/**
+ * نظام تحميل sql.js مع حفظ ملف WASM في IndexedDB
+ * أول مرة: يتحمل من CDN ويتحفظ محلياً
+ * المرات الجاية: يتحمل من المحلي بدون نت خالص
+ */
+
+const WASM_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.wasm';
+const SQLJS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.js';
+const IDB_NAME = 'HospitalNileAssets';
+const IDB_STORE = 'binaries';
+const WASM_KEY = 'sql-wasm-1.10.2';
+
+// فتح / إنشاء IndexedDB لحفظ ملف WASM
+function openAssetDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function getFromIDB(db, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function saveToIDB(db, key, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const req = tx.objectStore(IDB_STORE).put(value, key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * تحميل sql-wasm.js بشكل ذكي:
+ * 1. حاول من الكاش (Service Worker)
+ * 2. لو مش موجود، حمّله من CDN وحفظ WASM في IDB
+ */
+window.__loadSqlJs = async function() {
+  try {
+    const idb = await openAssetDB();
+    const cachedWasm = await getFromIDB(idb, WASM_KEY);
+
+    if (cachedWasm) {
+      // WASM محفوظ محلياً → استخدمه مباشرةً
+      console.log('[SQL.js] تحميل WASM من الكاش المحلي ✅');
+      const wasmUrl = URL.createObjectURL(new Blob([cachedWasm], { type: 'application/wasm' }));
+      window.__sqlJsWasmUrl = wasmUrl;
+    } else {
+      // مش موجود → حمّله من النت وخزّنه
+      console.log('[SQL.js] تحميل WASM من CDN...');
+      try {
+        const resp = await fetch(WASM_CDN);
+        if (resp.ok) {
+          const buf = await resp.arrayBuffer();
+          await saveToIDB(idb, WASM_KEY, buf);
+          const wasmUrl = URL.createObjectURL(new Blob([buf], { type: 'application/wasm' }));
+          window.__sqlJsWasmUrl = wasmUrl;
+          console.log('[SQL.js] تم حفظ WASM محلياً للاستخدام أوفلاين ✅');
+        }
+      } catch (e) {
+        console.warn('[SQL.js] تعذّر تحميل WASM من CDN (ربما أوفلاين):', e.message);
+      }
+    }
+  } catch (e) {
+    console.warn('[SQL.js] خطأ في IDB:', e.message);
+  }
+};
+</script>
+
+<!-- تحميل مكتبة sql.js من CDN أو الكاش -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;900&family=Tajawal:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+<!-- Fallback: لو الخطوط ما اتحملتش، هيستخدم system Arabic fonts -->
+<style>
+  body { font-family: 'Cairo', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
+</style>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Loading Screen -->
+<div id="loading-screen">
+  <div class="loader-logo">🏥 <span>مستشفى</span> النيل</div>
+  <div class="loader-bar"><div class="loader-bar-fill" id="loader-fill"></div></div>
+  <div class="loader-text" id="loader-text">جاري تهيئة قاعدة البيانات...</div>
+</div>
+
+<!-- Login Page -->
+<div id="login-page">
+  <div class="login-bg"></div>
+  <div class="login-grid"></div>
+  <div class="login-card fade-in">
+    <div class="login-logo">🏥</div>
+    <div class="login-title">مستشفى النيل</div>
+    <div class="login-subtitle">نظام إدارة متكامل</div>
+    <div id="login-error"></div>
+    <div class="form-group">
+      <label class="form-label">اسم المستخدم</label>
+      <input type="text" id="login-username" class="form-control" placeholder="أدخل اسم المستخدم" value="admin">
+    </div>
+    <div class="form-group">
+      <label class="form-label">كلمة المرور</label>
+      <input type="password" id="login-password" class="form-control" placeholder="أدخل كلمة المرور" value="admin123">
+    </div>
+    <button class="btn btn-primary btn-block" onclick="doLogin()">تسجيل الدخول</button>
+    <div class="login-hint">
+      <strong>بيانات تجريبية:</strong><br>
+      مدير: admin / admin123 &nbsp;|&nbsp; طبيب: dr.ahmed / doc123
+    </div>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app">
+  <div class="app-layout">
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-logo">
+          <div class="sidebar-logo-icon">🏥</div>
+          <div>
+            <div class="sidebar-logo-text">مستشفى النيل</div>
+            <div class="sidebar-logo-sub">نظام الإدارة</div>
+          </div>
+        </div>
+        <div class="sidebar-user">
+          <div class="sidebar-avatar" id="sb-avatar">م</div>
+          <div>
+            <div class="sidebar-username" id="sb-username">المستخدم</div>
+            <div class="sidebar-role" id="sb-role">الدور</div>
+          </div>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="nav-section-label">القائمة الرئيسية</div>
+        <div class="nav-item active" onclick="showPage('dashboard')">
+          <span class="nav-icon">📊</span>
+          <span>لوحة التحكم</span>
+        </div>
+        <div class="nav-item" onclick="showPage('appointments')">
+          <span class="nav-icon">📅</span>
+          <span>إدارة الحجوزات</span>
+          <span class="nav-badge" id="appt-badge" style="display:none">0</span>
+        </div>
+        <div class="nav-item" onclick="showPage('patients')">
+          <span class="nav-icon">👥</span>
+          <span>المرضى</span>
+        </div>
+        <div class="nav-item" onclick="showPage('doctors')">
+          <span class="nav-icon">👨‍⚕️</span>
+          <span>الكادر الطبي</span>
+        </div>
+        <div class="nav-section-label admin-only">الإدارة</div>
+        <div class="nav-item admin-only" onclick="showPage('accounts')">
+          <span class="nav-icon">👤</span>
+          <span>حسابات الموظفين</span>
+        </div>
+        <div class="nav-item" onclick="showPage('reports')">
+          <span class="nav-icon">📈</span>
+          <span>التقارير</span>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="nav-item" onclick="doLogout()">
+          <span class="nav-icon">🚪</span>
+          <span>تسجيل الخروج</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+
+      <!-- Topbar -->
+      <div class="topbar">
+        <div>
+          <div class="topbar-title" id="page-title">لوحة التحكم</div>
+          <div class="topbar-date" id="current-date"></div>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn btn-secondary btn-sm" onclick="showPage('appointments'); openModal('apptModal')">+ حجز جديد</button>
+        </div>
+      </div>
+
+      <!-- ✅ DB Toolbar -->
+      <div class="db-toolbar">
+        <span class="db-toolbar-label">
+          <span class="dot" id="save-dot"></span>
+          <span id="save-status">البيانات محفوظة محلياً</span>
+        </span>
+        <span class="db-toolbar-spacer"></span>
+        <button class="btn-db btn-export" onclick="exportDB()" title="تحميل ملف قاعدة البيانات على جهازك">
+          📥 تصدير .db
+        </button>
+        <button class="btn-db btn-import" onclick="document.getElementById('import-file-input').click()" title="رفع ملف قاعدة بيانات محفوظة">
+          📤 استيراد .db
+        </button>
+        <input type="file" id="import-file-input" accept=".db,.sqlite" onchange="importDB(event)">
+        <button class="btn-db btn-reset" onclick="resetDB()" title="مسح جميع البيانات والبدء من جديد">
+          🔄 إعادة ضبط
+        </button>
+      </div>
+
+      <div class="content-area">
+
+        <!-- ===== DASHBOARD ===== -->
+        <div class="page active" id="page-dashboard">
+          <div class="stats-grid" id="stats-grid"></div>
+          <div class="widgets-grid">
+            <div class="widget">
+              <div class="widget-title">📅 مواعيد اليوم</div>
+              <div id="today-appts"></div>
+            </div>
+            <div class="widget">
+              <div class="widget-title">📊 إحصائيات الأسبوع</div>
+              <div class="week-chart" id="week-chart"></div>
+            </div>
+            <div class="widget">
+              <div class="widget-title">👨‍⚕️ الأطباء المتاحون</div>
+              <div id="avail-doctors"></div>
+            </div>
+            <div class="widget">
+              <div class="widget-title">🏥 نظرة عامة على الأقسام</div>
+              <div id="dept-overview"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== APPOINTMENTS ===== -->
+        <div class="page" id="page-appointments">
+          <div class="page-header">
+            <div class="filter-bar">
+              <button class="btn btn-secondary btn-sm" onclick="filterApptStatus('')">الكل</button>
+              <button class="btn btn-secondary btn-sm" onclick="filterApptStatus('مجدول')">مجدول</button>
+              <button class="btn btn-secondary btn-sm" onclick="filterApptStatus('مؤكد')">مؤكد</button>
+              <button class="btn btn-secondary btn-sm" onclick="filterApptStatus('مكتمل')">مكتمل</button>
+              <button class="btn btn-secondary btn-sm" onclick="filterApptStatus('ملغي')">ملغي</button>
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="openModal('apptModal')">+ حجز جديد</button>
+          </div>
+          <div class="table-container">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>#</th><th>المريض</th><th>الطبيب</th><th>القسم</th>
+                  <th>التاريخ</th><th>الوقت</th><th>الحالة</th><th>إجراءات</th>
+                </tr>
+              </thead>
+              <tbody id="appt-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ===== PATIENTS ===== -->
+        <div class="page" id="page-patients">
+          <div class="page-header">
+            <input type="text" class="form-control" style="max-width:300px"
+              placeholder="🔍 بحث بالاسم أو الهاتف..." oninput="searchPatients(this.value)">
+            <button class="btn btn-primary btn-sm" onclick="openModal('patientModal')">+ مريض جديد</button>
+          </div>
+          <div class="table-container">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>#</th><th>الاسم</th><th>العمر</th><th>الجنس</th>
+                  <th>الهاتف</th><th>فصيلة الدم</th><th>الأمراض</th><th>إجراءات</th>
+                </tr>
+              </thead>
+              <tbody id="patients-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ===== DOCTORS ===== -->
+        <div class="page" id="page-doctors">
+          <div class="page-header">
+            <div></div>
+            <button class="btn btn-primary btn-sm admin-btn" onclick="openModal('doctorModal')">+ طبيب جديد</button>
+          </div>
+          <div class="doctors-grid" id="doctors-grid"></div>
+        </div>
+
+        <!-- ===== ACCOUNTS ===== -->
+        <div class="page" id="page-accounts">
+          <div class="page-header">
+            <div></div>
+            <button class="btn btn-primary btn-sm" onclick="openModal('accountModal')">+ موظف جديد</button>
+          </div>
+          <div class="accounts-grid" id="accounts-grid"></div>
+        </div>
+
+        <!-- ===== REPORTS ===== -->
+        <div class="page" id="page-reports">
+          <div id="reports-content"></div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODALS ===== -->
+
+<!-- Appointment Modal -->
+<div class="modal-overlay" id="apptModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">📅 حجز موعد جديد</div>
+      <button class="modal-close" onclick="closeModal('apptModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-group" style="position:relative">
+          <label class="form-label">المريض *</label>
+          <input type="text" id="a-patient-name" class="form-control" placeholder="اكتب اسم المريض..." autocomplete="off" oninput="filterPatientSuggestions(this.value)" onblur="setTimeout(()=>hideSuggestions(),200)">
+          <input type="hidden" id="a-patient">
+          <div id="patient-suggestions" class="autocomplete-dropdown"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">الطبيب *</label>
+          <select id="a-doctor" class="form-control form-select"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">التاريخ *</label>
+          <input type="date" id="a-date" class="form-control">
+        </div>
+        <div class="form-group">
+          <label class="form-label">الوقت</label>
+          <input type="time" id="a-time" class="form-control" value="09:00">
+        </div>
+        <div class="form-group">
+          <label class="form-label">نوع الكشف</label>
+          <select id="a-type" class="form-control form-select">
+            <option>كشف عادي</option><option>متابعة</option>
+            <option>استشارة</option><option>طوارئ</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">الحالة</label>
+          <select id="a-status" class="form-control form-select">
+            <option>مجدول</option><option>مؤكد</option>
+            <option>مكتمل</option><option>ملغي</option>
+          </select>
+        </div>
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">ملاحظات</label>
+          <textarea id="a-notes" class="form-control" rows="2" placeholder="ملاحظات اختيارية..."></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('apptModal')">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveAppointment()">💾 حفظ الحجز</button>
+    </div>
+  </div>
+</div>
+
+<!-- Patient Modal -->
+<div class="modal-overlay" id="patientModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="patient-modal-title">👥 إضافة مريض جديد</div>
+      <button class="modal-close" onclick="closeModal('patientModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="p-id">
+      <div class="form-grid">
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">الاسم الكامل *</label>
+          <input type="text" id="p-name" class="form-control" placeholder="اسم المريض">
+        </div>
+        <div class="form-group">
+          <label class="form-label">تاريخ الميلاد</label>
+          <input type="date" id="p-dob" class="form-control">
+        </div>
+        <div class="form-group">
+          <label class="form-label">الجنس</label>
+          <select id="p-gender" class="form-control form-select">
+            <option>ذكر</option><option>أنثى</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">فصيلة الدم</label>
+          <select id="p-blood" class="form-control form-select">
+            <option>O+</option><option>O-</option><option>A+</option><option>A-</option>
+            <option>B+</option><option>B-</option><option>AB+</option><option>AB-</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">رقم الهاتف</label>
+          <input type="tel" id="p-phone" class="form-control" placeholder="01xxxxxxxxx">
+        </div>
+        <div class="form-group">
+          <label class="form-label">البريد الإلكتروني</label>
+          <input type="email" id="p-email" class="form-control" placeholder="example@mail.com">
+        </div>
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">العنوان</label>
+          <input type="text" id="p-address" class="form-control" placeholder="المدينة / الحي">
+        </div>
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">الأمراض المزمنة / ملاحظات طبية</label>
+          <textarea id="p-conditions" class="form-control" rows="2" placeholder="مثال: مرض السكر، ضغط الدم..."></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('patientModal')">إلغاء</button>
+      <button class="btn btn-primary" onclick="savePatient()">💾 حفظ</button>
+    </div>
+  </div>
+</div>
+
+<!-- Doctor Modal -->
+<div class="modal-overlay" id="doctorModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">👨‍⚕️ إضافة طبيب جديد</div>
+      <button class="modal-close" onclick="closeModal('doctorModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="d-id">
+      <div class="form-grid">
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">اسم الطبيب *</label>
+          <input type="text" id="d-name" class="form-control" placeholder="د. الاسم الكامل">
+        </div>
+        <div class="form-group">
+          <label class="form-label">التخصص</label>
+          <select id="d-spec" class="form-control form-select">
+            <option>قلب وأوعية</option><option>نساء وتوليد</option>
+            <option>أطفال</option><option>باطنة</option><option>عظام</option>
+            <option>مخ وأعصاب</option><option>عيون</option><option>أنف وأذن وحنجرة</option>
+            <option>جراحة عامة</option><option>أمراض جلدية</option><option>طوارئ</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">رقم الهاتف</label>
+          <input type="tel" id="d-phone" class="form-control" placeholder="01xxxxxxxxx">
+        </div>
+        <div class="form-group">
+          <label class="form-label">سنوات الخبرة</label>
+          <input type="number" id="d-exp" class="form-control" placeholder="0" min="0">
+        </div>
+        <div class="form-group">
+          <label class="form-label">رسوم الكشف (جنيه)</label>
+          <input type="number" id="d-fee" class="form-control" placeholder="0" min="0">
+        </div>
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">الحالة</label>
+          <select id="d-status" class="form-control form-select">
+            <option>متاح</option><option>مشغول</option><option>إجازة</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('doctorModal')">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveDoctor()">💾 حفظ</button>
+    </div>
+  </div>
+</div>
+
+<!-- Account Modal -->
+<div class="modal-overlay" id="accountModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">👤 إضافة موظف جديد</div>
+      <button class="modal-close" onclick="closeModal('accountModal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="acc-id">
+      <div class="form-grid">
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">الاسم الكامل *</label>
+          <input type="text" id="acc-name" class="form-control" placeholder="الاسم الكامل">
+        </div>
+        <div class="form-group">
+          <label class="form-label">اسم المستخدم *</label>
+          <input type="text" id="acc-username" class="form-control" placeholder="username">
+        </div>
+        <div class="form-group">
+          <label class="form-label">كلمة المرور</label>
+          <input type="password" id="acc-password" class="form-control" placeholder="اتركها فارغة للإبقاء على الحالية">
+        </div>
+        <div class="form-group">
+          <label class="form-label">الدور الوظيفي</label>
+          <select id="acc-role" class="form-control form-select">
+            <option value="admin">مدير النظام</option>
+            <option value="doctor">طبيب</option>
+            <option value="staff">موظف استقبال</option>
+            <option value="nurse">ممرض/ممرضة</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">رقم الهاتف</label>
+          <input type="text" id="acc-phone" class="form-control" placeholder="01xxxxxxxxx">
+        </div>
+        <div class="form-group" style="grid-column: span 2">
+          <label class="form-label">القسم</label>
+          <input type="text" id="acc-dept" class="form-control" placeholder="مثال: الطوارئ، الاستقبال...">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('accountModal')">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveAccount()">💾 حفظ الحساب</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
